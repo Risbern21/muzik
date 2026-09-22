@@ -27,7 +27,12 @@ fn main() -> Result<()> {
         }
     }
 
-    if !fs::exists("/home/risbern/.config/muzik/config.json")? {
+    let config_dir = dirs::config_dir()
+        .expect("could not find config directory")
+        .join("muzik");
+    let config_path = config_dir.join("config.json");
+
+    if !fs::exists(&config_path)? {
         fs::create_dir_all("/home/risbern/.config/muzik")?;
         fs::write("/home/risbern/.config/muzik/config.json", MUZIK_CONFIG)?;
     }
