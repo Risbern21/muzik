@@ -1,0 +1,12 @@
+[package]
+name = "muzik"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = "1.0.229"
+anyhow = "1.0.104"
+rodio = "0.22.2"
+eframe = "0.36.2"
+egui_material_icons = "0.8.0"
+rustfft = "6.4.1"
