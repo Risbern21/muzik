@@ -1,22 +1,41 @@
+extern crate num;
+
 mod audio;
+mod fft;
+mod shader_widget;
 
 use std::{
     collections::VecDeque,
+    f32,
     fs::{self, File},
+    path::{Path, PathBuf},
     sync::mpsc,
 };
 
 use anyhow::Result;
-use eframe::egui::{self, Color32, Id, Modal, Rect, pos2};
+use eframe::{
+    egui::{self, Color32, Id, Modal, Rect, pos2},
+    egui_wgpu,
+    epaint::Hsva,
+};
+use num::Complex;
 use rodio::{Decoder, MixerDeviceSink, Player};
 
-const MUZIK_CONFIG: &str = "{
-    \"theme\":\"nightly\",
-}";
+use crate::shader_widget::{TriangleCallback, init_shader};
+
+const N: usize = 1 << 14;
+
+const MUZIK_CONFIG: &str = r#"{
+    "theme":"nightly"
+}"#;
 
 const MODAL_WIDGET_SPACE: f32 = 10.0;
 
 const PLAYBACK_SPEEDS: [f32; 4] = [0.5, 1.0, 2.0, 4.0];
+const SUPPORTED_EXTENSIONS: [&str; 5] = ["mp3", "mp4", "flac", "vorbis", "wav"];
+
+const SATURATION: f32 = 0.8_f32;
+const BRIGHTNESS: f32 = 0.8_f32;
 
 fn main() -> Result<()> {
     if let Ok(env_var) = std::env::var("XDG_SESSION_TYPE")
@@ -32,10 +51,15 @@ fn main() -> Result<()> {
         .join("muzik");
     let config_path = config_dir.join("config.json");
 
-    if !fs::exists(&config_path)? {
-        fs::create_dir_all("/home/risbern/.config/muzik")?;
-        fs::write("/home/risbern/.config/muzik/config.json", MUZIK_CONFIG)?;
-    }
+    let muzik_config = if !fs::exists(&config_path)? {
+        fs::create_dir_all(config_dir)?;
+        fs::write(&config_path, MUZIK_CONFIG)?;
+        MUZIK_CONFIG.to_string()
+    } else {
+        fs::read_to_string(&config_path)?
+    };
+
+    let config: MuzikConfig = serde_json::from_str(muzik_config.as_str())?;
 
     let args: Vec<String> = std::env::args().collect();
     let mut input_path: Option<String> = None;
@@ -49,12 +73,13 @@ fn main() -> Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_drag_and_drop(true),
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     eframe::run_native(
         "Muzik",
         native_options,
-        Box::new(|cc| Ok(Box::new(Muzik::new(cc, input_path)?))),
+        Box::new(|cc| Ok(Box::new(Muzik::new(cc, config, config_path, input_path)?))),
     )
     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
@@ -63,7 +88,9 @@ fn main() -> Result<()> {
 
 pub struct Muzik {
     input_path: Option<String>,
+    config_path: PathBuf,
     is_playing: bool,
+    is_paused: bool,
     playback_speed: f32,
     handle: MixerDeviceSink,
     player: Option<Player>,
@@ -71,62 +98,68 @@ pub struct Muzik {
     sample_history: VecDeque<f32>,
     max_visible_points: usize,
     theme: MuzikTheme,
-    visualisation_theme: VisualizationTheme,
-    visualisation_type: VisualizationType,
     settings_modal_open: bool,
 }
 
 impl Muzik {
-    fn new(cc: &eframe::CreationContext<'_>, input_path: Option<String>) -> Result<Muzik> {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        config: MuzikConfig,
+        config_path: PathBuf,
+        input_path: Option<String>,
+    ) -> Result<Muzik> {
         egui_material_icons::initialize(&cc.egui_ctx);
+        init_shader(&cc);
+
         let handle = rodio::DeviceSinkBuilder::open_default_sink()?;
         let is_playing = input_path.is_some();
 
         let mut muzik = Muzik {
             input_path,
+            config_path,
             is_playing,
+            is_paused: false,
             playback_speed: 1.0,
             handle,
             player: None,
             frame_receiver: None,
-            sample_history: VecDeque::from(vec![0.0; 1024]),
-            max_visible_points: 1024,
-            theme: MuzikTheme::Nightly,
-            visualisation_theme: VisualizationTheme::Lavender,
-            visualisation_type: VisualizationType::Type1,
+            sample_history: VecDeque::from(vec![0.0; N]),
+            max_visible_points: N,
+            theme: config.get_theme(),
             settings_modal_open: false,
         };
         muzik.play_audio()?;
         Ok(muzik)
     }
 
-    fn play_audio(&mut self) -> Result<()> {
-        // let (pcm_data, sample_rate) = audio::audio::decode_to_pcm(&input_path)?;
-        // let target_duration = 0.0464;
-
-        // let window_size = audio::audio::calculate_dynamic_window_size(sample_rate, target_duration);
-        // let hop_size = window_size / 2;
-
-        // let windowed_samples = apply_hann_window(&pcm_data, window_size, hop_size);
-        // if let Some((transformed, fft_size)) = audio::transform::fft(windowed_samples) {
-        //     self.all_audio_bands = transformed
-        //         .iter()
-        //         .map(|sample| audio::transform::get_audio_bands(sample, sample_rate, fft_size))
-        //         .collect();
-        if self.is_playing
-            && let Some(input_path) = &self.input_path
-        {
-            let (tx, rx) = mpsc::channel();
-            self.frame_receiver = Some(rx);
-
-            let file = File::open(input_path)?;
-            let source = Decoder::try_from(file)?;
-            let captured_source = audio::source::PcmCaptureSource::new(source, tx);
-            let player = Player::connect_new(self.handle.mixer());
-            self.playback_speed = 1.0;
-            player.append(captured_source);
-            self.player = Some(player);
+    fn play_audio(&mut self) -> Result<(), MuzikError> {
+        if !self.is_playing {
+            return Ok(());
         }
+        let Some(input_path) = &self.input_path else {
+            return Ok(());
+        };
+
+        let extension = Path::new(input_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+
+        match extension {
+            Some(ext) => if SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {},
+            _ => return Err(MuzikError::UnsupportedExtension(input_path.clone())),
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.frame_receiver = Some(rx);
+
+        let file = File::open(input_path)?;
+        let source = Decoder::try_from(file)?;
+        let captured_source = audio::source::PcmCaptureSource::new(source, tx);
+        let player = Player::connect_new(self.handle.mixer());
+        self.playback_speed = 1.0;
+        player.append(captured_source);
+        self.player = Some(player);
         Ok(())
     }
 
@@ -136,15 +169,19 @@ impl Muzik {
         }
     }
 
-    fn pause_audio(&self) {
+    fn pause_audio(&mut self) {
         if let Some(player) = &self.player {
             player.pause();
+            self.is_paused = true;
+            self.is_playing = false;
         }
     }
 
-    fn resume_audio(&self) {
+    fn resume_audio(&mut self) {
         if let Some(player) = &self.player {
             player.play();
+            self.is_paused = false;
+            self.is_playing = true;
         }
     }
 
@@ -155,7 +192,19 @@ impl Muzik {
         self.sample_history = VecDeque::from(vec![0.0; self.max_visible_points]);
         self.frame_receiver = None;
         self.is_playing = false;
+        self.is_paused = false;
         self.player = None;
+        self.input_path = None;
+    }
+
+    fn save_config(&self) -> Result<(), std::io::Error> {
+        let config = format!(
+            "{{
+                \"theme\":\"{}\",
+            }}",
+            self.theme.get_name(),
+        );
+        fs::write(&self.config_path, config)
     }
 
     fn update(&mut self) {
@@ -169,47 +218,6 @@ impl Muzik {
                 }
             }
         }
-    }
-
-    fn generate_rects(&self, screen_width: f32, screen_height: f32) -> Vec<Rect> {
-        let mut rects = Vec::with_capacity(self.sample_history.len());
-
-        let rect_width = screen_width / self.max_visible_points as f32;
-        let center_y = screen_height / 2.0;
-        let max_amplitude_height = screen_height / 2.0;
-
-        match self.visualisation_type {
-            VisualizationType::Type1 => {
-                for (index, &sample) in self.sample_history.iter().enumerate() {
-                    let x = index as f32 * rect_width;
-                    let h = sample * max_amplitude_height;
-                    let (top, bottom) = if h > 0.0 {
-                        (center_y - h, center_y)
-                    } else {
-                        (center_y, center_y - h)
-                    };
-
-                    rects.push(Rect::from_min_max(
-                        pos2(x, top),
-                        pos2(x + rect_width.max(1.0), bottom),
-                    ));
-                }
-            }
-            VisualizationType::Type2 => {
-                for (index, &sample) in self.sample_history.iter().enumerate() {
-                    let x = index as f32 * rect_width;
-                    let h = sample.abs() * max_amplitude_height;
-                    let (top, bottom) = (screen_height - h, screen_height);
-
-                    rects.push(Rect::from_min_max(
-                        pos2(x, top),
-                        pos2(x + rect_width.max(1.0), bottom),
-                    ));
-                }
-            }
-        }
-
-        rects
     }
 }
 
@@ -225,6 +233,14 @@ impl eframe::App for Muzik {
         {
             ctx.request_repaint();
         };
+
+        if ui.input(|i| i.key_pressed(egui::Key::Space)) {
+            if self.is_playing {
+                self.pause_audio();
+            } else if self.is_paused {
+                self.resume_audio();
+            }
+        }
 
         let screen_rect = ctx.content_rect();
 
@@ -247,9 +263,62 @@ impl eframe::App for Muzik {
             .show(ui, |ui| {
                 let painter = ui.painter();
 
-                let visual_rects = self.generate_rects(screen_rect.width(), screen_rect.height());
-                for bar in visual_rects {
-                    painter.rect_filled(bar, 0.0, self.visualisation_theme.get_rgb());
+                let screen_width = screen_rect.width();
+                let screen_height = screen_rect.height();
+
+                let input: Vec<Complex<f32>> = self
+                    .sample_history
+                    .iter()
+                    .map(|s| Complex::from(s))
+                    .collect();
+                let output = fft::transform::fft(&input);
+
+                //draw bars
+                let step = 1.06_f32;
+                let min_bin = 20.0_f32;
+                let max_bin = (N / 2) as f32;
+
+                let mut bar_count = 0usize;
+                let mut f = min_bin;
+                while f < max_bin {
+                    bar_count += 1;
+                    f *= step;
+                }
+
+                let rect_width = screen_width / bar_count as f32;
+                let mut f = min_bin;
+                for m in 0..bar_count {
+                    let f1 = f * step;
+                    let mut q = f;
+                    let mut amp = 0.0_f32;
+                    while q < f1 && q < N as f32 {
+                        amp += output[q as usize].norm();
+                        q += 1.0;
+                    }
+
+                    amp /= f1 - f + 1.0;
+                    let t = amp.min(screen_height);
+                    let x = m as f32 * rect_width;
+
+                    let bar = Rect::from_min_max(
+                        pos2(x, screen_height - t),
+                        pos2(x + rect_width, screen_height),
+                    );
+
+                    let color: Color32 =
+                        Hsva::new(m as f32 / 360.0, SATURATION, BRIGHTNESS, 1.0).into();
+                    painter.add(egui_wgpu::Callback::new_paint_callback(
+                        bar,
+                        TriangleCallback { size: 0.0 },
+                    ));
+                    painter.rect_stroke(
+                        bar,
+                        0.0,
+                        egui::Stroke::new(1.0, color),
+                        egui::StrokeKind::Outside,
+                    );
+
+                    f *= step;
                 }
 
                 if pointer_near_bottom {
@@ -280,17 +349,17 @@ impl eframe::App for Muzik {
                                     },
                                 );
 
-                                if ui
-                                    .button(egui_material_icons::icons::ICON_PLAY_ARROW)
-                                    .clicked()
-                                    && self.is_playing
-                                {
-                                    self.resume_audio();
-                                }
-                                if ui.button(egui_material_icons::icons::ICON_PAUSE).clicked()
-                                    && self.is_playing
-                                {
-                                    self.pause_audio();
+                                if self.is_paused {
+                                    if ui
+                                        .button(egui_material_icons::icons::ICON_PLAY_ARROW)
+                                        .clicked()
+                                    {
+                                        self.resume_audio();
+                                    }
+                                } else if self.is_playing {
+                                    if ui.button(egui_material_icons::icons::ICON_PAUSE).clicked() {
+                                        self.pause_audio();
+                                    }
                                 }
                                 if ui.button(egui_material_icons::icons::ICON_STOP).clicked()
                                     && self.is_playing
@@ -298,10 +367,6 @@ impl eframe::App for Muzik {
                                     self.stop_audio();
                                     ui.request_repaint();
                                 }
-
-                                let mut scalar = 0.0;
-                                ui.add(egui::Slider::new(&mut scalar, 0.0..=360.0).suffix("°"));
-                                ui.end_row();
 
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -344,69 +409,21 @@ impl eframe::App for Muzik {
                     ui.end_row();
                     ui.add_space(MODAL_WIDGET_SPACE);
 
-                    ui.label("Visualization Type");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut self.visualisation_type,
-                            VisualizationType::Type1,
-                            "Type-1",
-                        );
-                        ui.selectable_value(
-                            &mut self.visualisation_type,
-                            VisualizationType::Type2,
-                            "Type-2",
-                        );
-                    });
                     ui.end_row();
                     ui.add_space(MODAL_WIDGET_SPACE);
 
-                    ui.label("Visualization Theme");
+                    ui.separator();
                     ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut self.visualisation_theme,
-                            VisualizationTheme::Black,
-                            "Black",
-                        );
-                        ui.selectable_value(
-                            &mut self.visualisation_theme,
-                            VisualizationTheme::White,
-                            "White",
-                        );
-                        ui.selectable_value(
-                            &mut self.visualisation_theme,
-                            VisualizationTheme::Lavender,
-                            "Lavender",
-                        );
-                        ui.selectable_value(
-                            &mut self.visualisation_theme,
-                            VisualizationTheme::Pink,
-                            "Pink",
-                        );
-                        ui.selectable_value(
-                            &mut self.visualisation_theme,
-                            VisualizationTheme::Sky,
-                            "Sky",
-                        );
+                        if ui.button("Cancel").clicked() {
+                            self.settings_modal_open = false;
+                        }
+                        if ui.button("Save").clicked() {
+                            if let Err(e) = self.save_config() {
+                                eprintln!("Something went wrong :  {e}");
+                            }
+                            self.settings_modal_open = false;
+                        }
                     });
-
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut self.visualisation_theme,
-                            VisualizationTheme::Teal,
-                            "Teal",
-                        );
-                        ui.selectable_value(
-                            &mut self.visualisation_theme,
-                            VisualizationTheme::Crust,
-                            "Crust",
-                        );
-                        ui.selectable_value(
-                            &mut self.visualisation_theme,
-                            VisualizationTheme::Mauve,
-                            "Mauve",
-                        );
-                    });
-                    ui.end_row();
                 });
 
             if modal.should_close() {
@@ -419,16 +436,28 @@ impl eframe::App for Muzik {
                 let path = file.path();
                 self.input_path = Some(path.display().to_string());
                 self.is_playing = true;
-                self.play_audio().unwrap();
+                if let Err(_) = self.play_audio() {
+                    self.stop_audio();
+                    self.input_path = None;
+                };
             }
         });
     }
 }
 
-#[derive(PartialEq)]
-enum VisualizationType {
-    Type1,
-    Type2,
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct MuzikConfig {
+    pub theme: String,
+}
+
+impl MuzikConfig {
+    fn get_theme(&self) -> MuzikTheme {
+        match self.theme.as_str() {
+            "dark" => MuzikTheme::Dark,
+            "light" => MuzikTheme::Light,
+            _ => MuzikTheme::Nightly,
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -462,31 +491,57 @@ impl MuzikTheme {
             Self::Nightly => egui::Color32::from_rgb(108, 112, 134),
         }
     }
-}
 
-#[derive(PartialEq)]
-enum VisualizationTheme {
-    Black,
-    White,
-    Lavender,
-    Pink,
-    Sky,
-    Teal,
-    Crust,
-    Mauve,
-}
-
-impl VisualizationTheme {
-    fn get_rgb(&self) -> Color32 {
+    fn get_name(&self) -> String {
         match self {
-            Self::Black => Color32::from_rgb(0, 0, 0),
-            Self::White => Color32::from_rgb(255, 255, 255),
-            Self::Lavender => Color32::from_rgb(183, 189, 248),
-            Self::Pink => Color32::from_rgb(245, 194, 231),
-            Self::Sky => Color32::from_rgb(4, 165, 229),
-            Self::Teal => Color32::from_rgb(139, 213, 202),
-            Self::Crust => Color32::from_rgb(220, 224, 232),
-            Self::Mauve => Color32::from_rgb(198, 160, 246),
+            Self::Dark => "dark".to_string(),
+            Self::Light => "light".to_string(),
+            _ => "nightly".to_string(),
         }
+    }
+}
+
+#[derive(Debug)]
+enum MuzikError {
+    UnsupportedExtension(String),
+    Io(std::io::Error),
+    DecodeError(rodio::decoder::DecoderError),
+}
+
+impl std::fmt::Display for MuzikError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedExtension(path) => {
+                write!(f, "unsupported file type {path:?}")
+            }
+            Self::Io(e) => {
+                write!(f, "failed to open file {e:?}")
+            }
+            Self::DecodeError(e) => {
+                write!(f, "unable to decode file {e:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MuzikError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UnsupportedExtension(_) => None,
+            Self::Io(e) => Some(e),
+            Self::DecodeError(e) => Some(e),
+        }
+    }
+}
+
+impl From<std::io::Error> for MuzikError {
+    fn from(e: std::io::Error) -> Self {
+        MuzikError::Io(e)
+    }
+}
+
+impl From<rodio::decoder::DecoderError> for MuzikError {
+    fn from(e: rodio::decoder::DecoderError) -> Self {
+        MuzikError::DecodeError(e)
     }
 }
