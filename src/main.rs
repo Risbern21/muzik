@@ -109,7 +109,7 @@ impl Muzik {
         input_path: Option<String>,
     ) -> Result<Muzik> {
         egui_material_icons::initialize(&cc.egui_ctx);
-        init_shader(&cc);
+        init_shader(cc);
 
         let handle = rodio::DeviceSinkBuilder::open_default_sink()?;
         let is_playing = input_path.is_some();
@@ -266,11 +266,8 @@ impl eframe::App for Muzik {
                 let screen_width = screen_rect.width();
                 let screen_height = screen_rect.height();
 
-                let input: Vec<Complex<f32>> = self
-                    .sample_history
-                    .iter()
-                    .map(|s| Complex::from(s))
-                    .collect();
+                let input: Vec<Complex<f32>> =
+                    self.sample_history.iter().map(Complex::from).collect();
                 let output = fft::transform::fft(&input);
 
                 //draw bars
@@ -349,17 +346,16 @@ impl eframe::App for Muzik {
                                     },
                                 );
 
-                                if self.is_paused {
-                                    if ui
+                                if self.is_paused
+                                    && ui
                                         .button(egui_material_icons::icons::ICON_PLAY_ARROW)
                                         .clicked()
-                                    {
-                                        self.resume_audio();
-                                    }
-                                } else if self.is_playing {
-                                    if ui.button(egui_material_icons::icons::ICON_PAUSE).clicked() {
-                                        self.pause_audio();
-                                    }
+                                {
+                                    self.resume_audio();
+                                } else if self.is_playing
+                                    && ui.button(egui_material_icons::icons::ICON_PAUSE).clicked()
+                                {
+                                    self.pause_audio();
                                 }
                                 if ui.button(egui_material_icons::icons::ICON_STOP).clicked()
                                     && self.is_playing
@@ -436,7 +432,7 @@ impl eframe::App for Muzik {
                 let path = file.path();
                 self.input_path = Some(path.display().to_string());
                 self.is_playing = true;
-                if let Err(_) = self.play_audio() {
+                if self.play_audio().is_err() {
                     self.stop_audio();
                     self.input_path = None;
                 };

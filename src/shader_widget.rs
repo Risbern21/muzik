@@ -72,7 +72,7 @@ pub fn custom_painting(size: f32, ui: &mut egui::Ui) {
     //
     // The paint callback is called after prepare and is given access to the render pass, which
     // can be used to issue draw commands.
-    let callback = egui_wgpu::Callback::new_paint_callback(rect, TriangleCallback { size: size });
+    let callback = egui_wgpu::Callback::new_paint_callback(rect, TriangleCallback { size });
 
     ui.painter().add(callback);
 }
