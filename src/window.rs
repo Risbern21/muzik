@@ -1,6 +1,5 @@
 use std::f32::consts::PI;
 
-#[allow(dead_code)]
 pub fn calculate_dynamic_window_size(sample_rate: u32, target_duration: f32) -> usize {
     let exact_samples = sample_rate as f32 * target_duration;
 
@@ -11,8 +10,10 @@ pub fn calculate_dynamic_window_size(sample_rate: u32, target_duration: f32) -> 
     dynamic_window_size.clamp(512, 8192)
 }
 
-#[allow(dead_code)]
-pub fn apply_hann_window(samples: &[f32], window_size: usize, hop_size: usize) -> Vec<Vec<f32>> {
+pub fn apply_hann_window(samples: &[&f32], window_size: usize, hop_size: usize) -> Vec<f32> {
+    assert!(window_size > 2, "window size must be atleast 2");
+    assert!(hop_size > 0, "hop size must be greater than 0");
+
     let hann_window = create_hann_window(window_size);
     let mut windowed_frames = Vec::new();
 
@@ -25,14 +26,13 @@ pub fn apply_hann_window(samples: &[f32], window_size: usize, hop_size: usize) -
             .map(|(&s, &w)| s * w)
             .collect();
 
-        windowed_frames.push(windowed_chunk);
+        windowed_frames.extend(windowed_chunk);
         start += hop_size;
     }
 
     windowed_frames
 }
 
-#[allow(dead_code)]
 fn create_hann_window(window_size: usize) -> Vec<f32> {
     let mut window = Vec::with_capacity(window_size);
     for i in 0..window_size {

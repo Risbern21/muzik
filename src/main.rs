@@ -3,6 +3,7 @@ extern crate num;
 mod audio;
 mod fft;
 mod shader_widget;
+mod window;
 
 use std::{
     collections::VecDeque,
@@ -10,16 +11,18 @@ use std::{
     fs::{self, File},
     path::{Path, PathBuf},
     sync::mpsc,
+    time,
 };
 
 use anyhow::Result;
+use bytemuck::Contiguous;
 use eframe::{
     egui::{self, Color32, Id, Modal, Rect, pos2},
     egui_wgpu,
     epaint::Hsva,
 };
 use num::Complex;
-use rodio::{Decoder, MixerDeviceSink, Player};
+use rodio::{Decoder, MixerDeviceSink, Player, Source};
 
 use crate::shader_widget::{TriangleCallback, init_shader};
 
@@ -36,6 +39,13 @@ const SUPPORTED_EXTENSIONS: [&str; 5] = ["mp3", "mp4", "flac", "vorbis", "wav"];
 
 const SATURATION: f32 = 0.8_f32;
 const BRIGHTNESS: f32 = 0.8_f32;
+
+const STEP: f32 = 1.06_f32;
+const MIN_BIN: f32 = 20.0_f32;
+const MAX_BIN: f32 = (N / 2) as f32;
+
+const FLOOR_DB: f32 = -80.0;
+const CEIL_DB: f32 = 0.0;
 
 fn main() -> Result<()> {
     if let Ok(env_var) = std::env::var("XDG_SESSION_TYPE")
@@ -87,18 +97,22 @@ fn main() -> Result<()> {
 }
 
 pub struct Muzik {
-    input_path: Option<String>,
+    bar_count: usize,
     config_path: PathBuf,
     is_playing: bool,
     is_paused: bool,
     playback_speed: f32,
     handle: MixerDeviceSink,
+    input_path: Option<String>,
+    sample_rate: Option<u32>,
+    total_duration: Option<time::Duration>,
     player: Option<Player>,
     frame_receiver: Option<mpsc::Receiver<f32>>,
     sample_history: VecDeque<f32>,
     max_visible_points: usize,
     theme: MuzikTheme,
     settings_modal_open: bool,
+    smoothed: Vec<f32>,
 }
 
 impl Muzik {
@@ -114,19 +128,30 @@ impl Muzik {
         let handle = rodio::DeviceSinkBuilder::open_default_sink()?;
         let is_playing = input_path.is_some();
 
+        let mut bar_count = 0usize;
+        let mut f = MIN_BIN;
+        while f < MAX_BIN {
+            bar_count += 1;
+            f *= STEP;
+        }
+
         let mut muzik = Muzik {
-            input_path,
+            bar_count,
             config_path,
             is_playing,
             is_paused: false,
             playback_speed: 1.0,
             handle,
+            input_path,
+            sample_rate: None,
+            total_duration: None,
             player: None,
             frame_receiver: None,
             sample_history: VecDeque::from(vec![0.0; N]),
             max_visible_points: N,
             theme: config.get_theme(),
             settings_modal_open: false,
+            smoothed: vec![0.0_f32; bar_count],
         };
         muzik.play_audio()?;
         Ok(muzik)
@@ -156,6 +181,8 @@ impl Muzik {
         let file = File::open(input_path)?;
         let source = Decoder::try_from(file)?;
         let captured_source = audio::source::PcmCaptureSource::new(source, tx);
+        self.sample_rate = Some(captured_source.sample_rate().into_integer());
+        self.total_duration = captured_source.total_duration();
         let player = Player::connect_new(self.handle.mixer());
         self.playback_speed = 1.0;
         player.append(captured_source);
@@ -266,56 +293,80 @@ impl eframe::App for Muzik {
                 let screen_width = screen_rect.width();
                 let screen_height = screen_rect.height();
 
-                let input: Vec<Complex<f32>> =
-                    self.sample_history.iter().map(Complex::from).collect();
+                let max_bar_height = screen_height;
+
+                let input: Vec<Complex<f32>> = match (self.sample_rate, self.total_duration) {
+                    (Some(sample_rate), Some(total_duration)) => {
+                        let input_samples: Vec<&f32> = self.sample_history.iter().collect();
+                        let window_size = window::calculate_dynamic_window_size(
+                            sample_rate,
+                            total_duration.as_secs_f32(),
+                        );
+                        let windowed_samples =
+                            window::apply_hann_window(&input_samples, window_size, window_size / 2);
+                        windowed_samples.iter().map(Complex::from).collect()
+                    }
+                    _ => Vec::new(),
+                };
                 let output = fft::transform::fft(&input);
 
-                //draw bars
-                let step = 1.06_f32;
-                let min_bin = 20.0_f32;
-                let max_bin = (N / 2) as f32;
-
-                let mut bar_count = 0usize;
-                let mut f = min_bin;
-                while f < max_bin {
-                    bar_count += 1;
-                    f *= step;
-                }
-
-                let rect_width = screen_width / bar_count as f32;
-                let mut f = min_bin;
-                for m in 0..bar_count {
-                    let f1 = f * step;
+                let rect_width = screen_width / self.bar_count as f32;
+                let mut f = MIN_BIN;
+                for m in 0..self.bar_count {
+                    // take average of skipped frames
+                    let f1 = f * STEP;
                     let mut q = f;
                     let mut amp = 0.0_f32;
-                    while q < f1 && q < N as f32 {
+                    while q < f1 && q < N as f32 && q < output.len() as f32 {
                         amp += output[q as usize].norm();
                         q += 1.0;
                     }
 
                     amp /= f1 - f + 1.0;
-                    let t = amp.min(screen_height);
-                    let x = m as f32 * rect_width;
 
-                    let bar = Rect::from_min_max(
-                        pos2(x, screen_height - t),
-                        pos2(x + rect_width, screen_height),
-                    );
+                    // take hann gain (0.5) into account
+                    let n = input.len().max(1) as f32;
+                    let scale = 2.0 / (n * 0.5);
+                    amp *= scale;
+
+                    // normalize into 0..1 range
+                    let norm = {
+                        let db_amp = 20.0 * (amp + 1e-9).log10();
+                        ((db_amp - FLOOR_DB) / (CEIL_DB - FLOOR_DB)).clamp(0.0, 1.0)
+                    };
+
+                    // smooth
+                    let prev = self.smoothed[m];
+                    let s = if norm > prev {
+                        prev - (norm - prev) * 0.6
+                    } else {
+                        prev + (norm - prev) * 0.15
+                    };
+                    self.smoothed[m] = s;
+
+                    // map
+                    let t = norm * max_bar_height;
+                    let x = m as f32 * rect_width;
+                    let y = screen_height - t;
+
+                    //draw shader bars
+                    let bar = Rect::from_min_max(pos2(x, y), pos2(x + rect_width, screen_height));
 
                     let color: Color32 =
                         Hsva::new(m as f32 / 360.0, SATURATION, BRIGHTNESS, 1.0).into();
+                    let stroke_width = t.min(1.0);
                     painter.add(egui_wgpu::Callback::new_paint_callback(
                         bar,
                         TriangleCallback { size: 0.0 },
                     ));
                     painter.rect_stroke(
                         bar,
-                        0.0,
-                        egui::Stroke::new(1.0, color),
+                        0.5,
+                        egui::Stroke::new(stroke_width, color),
                         egui::StrokeKind::Outside,
                     );
 
-                    f *= step;
+                    f *= STEP;
                 }
 
                 if pointer_near_bottom {
@@ -358,7 +409,7 @@ impl eframe::App for Muzik {
                                     self.pause_audio();
                                 }
                                 if ui.button(egui_material_icons::icons::ICON_STOP).clicked()
-                                    && self.is_playing
+                                    && (self.is_playing || self.is_paused)
                                 {
                                     self.stop_audio();
                                     ui.request_repaint();
